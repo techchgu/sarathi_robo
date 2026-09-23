@@ -1,0 +1,412 @@
+// --- Basic version ---
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <ESP32Servo.h>
+#include "BluetoothSerial.h" 
+
+// --- WiFi & Bluetooth Settings ---
+const char* ssid = "SARATHI_MISSION_CONTROL";
+const char* password = "shivamkumar";
+WebServer server(80);
+BluetoothSerial SerialBT; 
+
+// --- OLED Display ---
+Adafruit_SSD1306 display(128, 64, &Wire, -1);
+
+// --- Servo Motor ---
+Servo radarServo;
+
+// --- पिन डेफिनिशन ---
+#define TRIG 5
+#define ECHO 18
+#define BUZZER 25
+#define LED 26       
+#define MQ2 34       
+#define IR_FLOOR 35  
+#define LDR1 32      
+#define LDR2 33      
+#define IN1 12       
+#define IN2 13
+#define IN3 14
+#define IN4 27
+#define SERVO_PIN 19 
+
+// --- Variables ---
+int mode = 1; // 1: AUTO MODE, 0: MANUAL MODE, 2: ECO MODE
+int gasLevel = 0;
+int lastGasLevel = 0; // प्रेडिक्टिव एनालिसिस के लिए
+String robotStatus = "AUTO MODE"; 
+unsigned long lastUpdate = 0;
+long globalDist = 0;
+
+// Failsafe Flags 
+bool ultrasonicHealthy = true;
+bool gasSensorHealthy = true;
+
+// एंटी-कॉर्नर वेरिएबल
+int turnCounter = 0; 
+
+// --- Speed Control constants ---
+const int MAX_SPEED = 255;  
+const int MIN_SPEED = 140;  
+const int TURN_SPEED = 160; 
+int currentSpeed = MAX_SPEED;
+
+// --- IIT LEVEL LIVE TELEMETRY DASHBOARD (HTML, CSS & JS AJAX) ---
+const char* htmlPage = R"rawliteral(
+<!DOCTYPE html><html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SARATHI MISSION CONTROL v11.3</title>
+<style>
+body { font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background: #0a0a0a; color: #00ff66; text-align: center; margin: 0; padding: 20px; }
+h1 { color: #00ffff; text-shadow: 0 0 10px rgba(0,255,255,0.5); font-size: 28px; margin-bottom: 5px; }
+.developer { color: #888; font-size: 14px; margin-bottom: 20px; }
+.container { display: flex; flex-wrap: wrap; justify-content: center; max-width: 900px; margin: 0 auto; }
+.card { background: #141414; border: 1px solid #00ff66; border-radius: 12px; padding: 15px; margin: 10px; width: 200px; box-shadow: 0 4px 15px rgba(0,255,102,0.1); }
+.card h3 { margin: 0 0 10px 0; color: #00ffff; font-size: 16px; }
+.card p { font-size: 22px; font-weight: bold; margin: 5px 0; }
+.control-panel { width: 100%; max-width: 550px; background: #141414; border: 1px solid #00ffffff; border-radius: 15px; padding: 20px; margin: 20px auto; }
+.btn { background: #00ff66; color: #000; padding: 12px 25px; font-size: 15px; border: none; border-radius: 6px; margin: 6px; width: 130px; font-weight: bold; cursor: pointer; transition: 0.2s; box-shadow: 0 0 8px rgba(0,255,102,0.3); }
+.btn:hover { background: #00ffff; box-shadow: 0 0 15px rgba(0,255,255,0.6); }
+.stop { background: #ff0033; color: white; width: 280px; box-shadow: 0 0 8px rgba(255,0,51,0.3); }
+.stop:hover { background: #ff3366; }
+.mode-btn { background: #0088ff; color: white; width: 135px; }
+.eco-btn { background: #ff9900; color: black; width: 135px; }
+</style>
+<script>
+setInterval(function() {
+  fetch('/data').then(response => response.json()).then(data => {
+    document.getElementById('dist').innerText = data.distance + " cm";
+    document.getElementById('gas').innerText = data.gas;
+    document.getElementById('speed').innerText = data.speed;
+    document.getElementById('status').innerText = data.status;
+    document.getElementById('wifi').innerText = data.wifi + " dBm";
+  }).catch(err => console.log(err));
+}, 500); 
+</script>
+</head><body>
+<h1>SARATHI TELEMETRY CONTROL</h1>
+<div class="developer">System Architect: Techcraft</div>
+<div class="container">
+  <div class="card"><h3>Obstacle Distance</h3><p id="dist">0 cm</p></div>
+  <div class="card"><h3>Gas Level (MQ2)</h3><p id="gas">0</p></div>
+  <div class="card"><h3>Current Speed</h3><p id="speed">0</p></div>
+  <div class="card"><h3>WiFi Signal</h3><p id="wifi">0 dBm</p></div>
+</div>
+<div class="control-panel">
+  <h3>System Status: <span id="status" style="color:#fff;">INITIALIZING...</span></h3>
+  <button class="btn mode-btn" onclick="fetch('/MODE_AUTO')">AUTO MODE</button>
+  <button class="btn eco-btn" onclick="fetch('/MODE_ECO')">ECO MODE</button>
+  <button class="btn mode-btn" onclick="fetch('/MODE_MANUAL')" style="background:#333; border:1px solid #888;">MANUAL</button><br><br>
+  <button class="btn" onclick="fetch('/FWD')">FORWARD</button><br>
+  <button class="btn" onclick="fetch('/LEFT')">LEFT</button>
+  <button class="btn" onclick="fetch('/RIGHT')">RIGHT</button><br>
+  <button class="btn" onclick="fetch('/BACK')">BACK</button><br>
+  <button class="btn stop" onclick="fetch('/STOP')">EMERGENCY STOP</button>
+</div>
+</body></html>)rawliteral";
+
+// --- Advanced Speed-Controlled Motor Functions ---
+void stopMotors() { 
+  analogWrite(IN1, 0); analogWrite(IN2, 0); 
+  analogWrite(IN3, 0); analogWrite(IN4, 0); 
+}
+
+void moveForward(int speed) { 
+  analogWrite(IN1, speed); analogWrite(IN2, 0); 
+  analogWrite(IN3, speed); analogWrite(IN4, 0); 
+  if (mode == 2) robotStatus = "ECO: MOVING FWD";
+  else robotStatus = "MOVING FWD"; 
+}
+
+void moveBackward(int speed) { 
+  analogWrite(IN1, 0);     analogWrite(IN2, speed); 
+  analogWrite(IN3, 0);     analogWrite(IN4, speed); 
+  if (mode == 2) robotStatus = "ECO: MOVING BACK";
+  else robotStatus = "MOVING BACK"; 
+}
+
+void turnLeft(int speed) { 
+  analogWrite(IN1, 0);     analogWrite(IN2, speed); 
+  analogWrite(IN3, speed); analogWrite(IN4, 0); 
+  if (mode == 2) robotStatus = "ECO: TUNING LEFT";
+  else robotStatus = "TURNING LEFT"; 
+}
+
+void turnRight(int speed) { 
+  analogWrite(IN1, speed); analogWrite(IN2, 0); 
+  analogWrite(IN3, 0);     analogWrite(IN4, speed); 
+  if (mode == 2) robotStatus = "ECO: TUNING RIGHT";
+  else robotStatus = "TURNING RIGHT"; 
+}
+
+// --- सुरक्षित दूरी मापन ---
+long getDistance() {
+  digitalWrite(TRIG, LOW); delayMicroseconds(2);
+  digitalWrite(TRIG, HIGH); delayMicroseconds(10);
+  digitalWrite(TRIG, LOW);
+  
+  // 15000us टाइमआउट = ~250cm रेंज (फास्ट और लैग-फ्री नेविगेशन)
+  long duration = pulseIn(ECHO, HIGH, 15000); 
+  if (duration == 0) { 
+    ultrasonicHealthy = false; 
+    return 400; // फेल-सेफ
+  } else { 
+    ultrasonicHealthy = true; 
+    return duration * 0.034 / 2; 
+  }
+}
+
+// --- प्री-मूवमेंट रडार स्कैन फंक्शन ---
+void scanAndChoosePath() {
+  if (mode == 2) robotStatus = "ECO: SCANNING...";
+  else robotStatus = "SCANNING PATH...";
+  stopMotors();
+  
+  // राइट स्कैन (30 डिग्री)
+  radarServo.write(30); 
+  delay(350);
+  long rightDistance = getDistance();
+  
+  // लेफ्ट स्कैन (150 डिग्री)
+  radarServo.write(150); 
+  delay(350);
+  long leftDistance = getDistance();
+  
+  // सर्वो वापस बीच में (90 डिग्री)
+  radarServo.write(90); 
+  delay(200); 
+  
+  // निर्णय लॉजिक: जिस तरफ ज़्यादा जगह होगी रोबोट उस तरफ मुड़ेगा
+  if (leftDistance > rightDistance) {
+    turnLeft(TURN_SPEED);
+    delay(450);
+  } else {
+    turnRight(TURN_SPEED);
+    delay(450);
+  }
+  stopMotors();
+}
+
+// --- ब्लूटूथ वॉइस कमांड प्रोसेसर ---
+void processVoiceCommand(String command) {
+  command.trim();
+  command.toLowerCase(); 
+
+  if (command == "auto" || command == "automatic") {
+    mode = 1; robotStatus = "BT: AUTO MODE";
+    scanAndChoosePath(); 
+  }
+  else if (command == "manual") {
+    mode = 0; stopMotors(); robotStatus = "BT: MANUAL MODE";
+  }
+  else if (command == "eco" || command == "eco mode") {
+    mode = 2; robotStatus = "BT: ECO MODE";
+    scanAndChoosePath();
+  }
+  
+  if (mode == 0) { 
+    if (command == "forward" || command == "go" || command == "aage") { moveForward(MAX_SPEED); }
+    else if (command == "backward" || command == "back" || command == "piche") { moveBackward(MAX_SPEED); }
+    else if (command == "left" || command == "baaye") { turnLeft(TURN_SPEED); }
+    else if (command == "right" || command == "daaye") { turnRight(TURN_SPEED); }
+    else if (command == "stop" || command == "ruko") { stopMotors(); robotStatus = "BT: STOPPED"; }
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  SerialBT.begin("SARATHI_VOICE_CONTROL"); 
+  
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT); pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+  pinMode(BUZZER, OUTPUT); pinMode(LED, OUTPUT);
+  pinMode(TRIG, OUTPUT); pinMode(ECHO, INPUT);
+  pinMode(IR_FLOOR, INPUT); 
+  pinMode(LDR1, INPUT); pinMode(LDR2, INPUT); 
+
+  // ESP32 Servo allocate configuration
+  ESP32PWM::allocateTimer(0);
+  ESP32PWM::allocateTimer(1);
+  radarServo.setPeriodHertz(50);
+  radarServo.attach(SERVO_PIN, 500, 2400);
+  radarServo.write(90); 
+
+  // OLED Intro
+  if(display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    display.clearDisplay();
+    display.setTextSize(1); display.setTextColor(WHITE);
+    display.setCursor(10,10); display.println("WELCOME CHIEF");
+    display.setCursor(10,30); display.println("ER. SHIVAM KUMAR");
+    display.display();
+    
+    digitalWrite(BUZZER, HIGH); delay(150);  digitalWrite(BUZZER, LOW); delay(100);
+    digitalWrite(BUZZER, HIGH); delay(300);  digitalWrite(BUZZER, LOW);
+    delay(1500); 
+  }
+
+  WiFi.softAP(ssid, password);
+  
+  // वेब सर्वर रूट्स
+  server.on("/", [](){ server.send(200, "text/html", htmlPage); });
+  
+  // --- IIT Level Live Data Endpoint (JSON) ---
+  server.on("/data", [](){
+    int currentRSSI = WiFi.RSSI(); 
+    String json = "{";
+    json += "\"distance\":" + String(globalDist) + ",";
+    json += "\"gas\":" + String(gasLevel) + ",";
+    json += "\"speed\":" + String(currentSpeed) + ",";
+    json += "\"wifi\":" + String(currentRSSI == 31 ? 0 : currentRSSI) + ","; // Hotspot softAP fix
+    json += "\"status\":\"" + robotStatus + "\"";
+    json += "}";
+    server.send(200, "application/json", json);
+  });
+
+  server.on("/FWD", [](){ if(mode==0) moveForward(MAX_SPEED); server.send(200); });
+  server.on("/BACK", [](){ if(mode==0) moveBackward(MAX_SPEED); server.send(200); });
+  server.on("/LEFT", [](){ if(mode==0) turnLeft(TURN_SPEED); server.send(200); });
+  server.on("/RIGHT", [](){ if(mode==0) turnRight(TURN_SPEED); server.send(200); });
+  server.on("/STOP", [](){ stopMotors(); robotStatus="EMERGENCY STOP"; server.send(200); });
+  server.on("/MODE_AUTO", [](){ mode=1; robotStatus="AUTO MODE"; server.send(200); });
+  server.on("/MODE_MANUAL", [](){ mode=0; stopMotors(); robotStatus="MANUAL MODE"; server.send(200); });
+  server.on("/MODE_ECO", [](){ mode=2; robotStatus="ECO MODE"; server.send(200); });
+
+  server.begin(); 
+  
+  // ऑन होते ही डिफ़ॉल्ट AUTO MODE (mode=1) पर सबसे पहले रस्ता स्कैन करेगा
+  if(mode == 1) {
+    scanAndChoosePath();
+  }
+}
+
+void loop() {
+  server.handleClient();
+
+  if (SerialBT.available()) {
+    String incomingCmd = SerialBT.readStringUntil('\n'); // फास्ट रीडिंग बिना लैग के
+    processVoiceCommand(incomingCmd);
+  }
+  
+  // सेंसर अपडेट लॉजिक (200ms non-blocking)
+  if (millis() - lastUpdate > 200) {
+    globalDist = getDistance();
+    gasLevel = analogRead(MQ2);
+    int floorStatus = digitalRead(IR_FLOOR); 
+    
+    // --- स्मार्ट ऑटो-लाइटिंग (LDR) ---
+    int ldrVal1 = analogRead(LDR1);
+    int ldrVal2 = analogRead(LDR2);
+    if (ldrVal1 < 1500 || ldrVal2 < 1500) {
+      if (mode == 2) {
+        analogWrite(LED, 75); // Eco Mode में हेडलाइट सिर्फ 30% ब्राइटनेस पर जलेगी (पावर सेविंग)
+      } else {
+        digitalWrite(LED, HIGH); // नॉर्मल मोड में फुल ब्राइटनेस
+      }
+    } else { 
+      digitalWrite(LED, LOW); 
+    }
+
+    // गैस सेंसर हेल्थ चेक
+    if (gasLevel == 0 || gasLevel >= 4095) { 
+      gasSensorHealthy = false; 
+      gasLevel = 150; // फेल-सेफ
+    } else { 
+      gasSensorHealthy = true; 
+    }
+
+    // --- IIT LEVEL: PREDICTIVE GAS RATE-OF-RISE ANALYSIS ---
+    bool gasSpikeFault = false;
+    if(gasSensorHealthy && lastGasLevel > 0) {
+      int gasDelta = gasLevel - lastGasLevel;
+      if (gasDelta > 400) { 
+        gasSpikeFault = true; 
+      }
+    }
+    lastGasLevel = gasLevel; 
+
+    // --- OLED लाइव डिस्प्ले अपडेट ---
+    display.clearDisplay();
+    display.setCursor(0,0); 
+    if (mode == 1) display.println("MODE: AUTO");
+    else if (mode == 0) display.println("MODE: MAN.");
+    else if (mode == 2) display.println("MODE: ECO (PWR-SAV)");
+    
+    display.print("US: "); display.println(ultrasonicHealthy ? String(globalDist)+"cm" : "FAULT!");
+    display.print("GAS: "); display.println(gasSensorHealthy ? String(gasLevel) : "FAULT!");
+    display.print("SPEED: "); display.println(currentSpeed);
+    display.display();
+
+    // 1. सर्वोच्च सुरक्षा चक्र (सेंसर हेल्दी होने पर ही एक्टिव होगा)
+    if (gasSensorHealthy && gasSpikeFault) {
+      stopMotors();
+      digitalWrite(BUZZER, HIGH);
+      robotStatus = "CRITICAL GAS SPIKE!";
+    }
+    else if (gasSensorHealthy && gasLevel > 2000) {
+      stopMotors();
+      digitalWrite(BUZZER, HIGH);
+      robotStatus = "GAS THRESHOLD EXCEEDED!";
+    } 
+    else if (floorStatus == HIGH) { 
+      stopMotors();
+      digitalWrite(BUZZER, HIGH);
+      robotStatus = "CLIFF DETECTED!";
+    } 
+    else {
+      if (gasLevel <= 2000 && floorStatus == LOW && !gasSpikeFault) {
+        digitalWrite(BUZZER, LOW);
+      }
+
+      // 2. ऑटो मोड और इको मोड संयुक्त नेविगेशन लॉजिक (Adaptive Speed के साथ)
+      if (mode == 1 || mode == 2) {
+        
+        // इको मोड (mode 2) में बैटरी बचाने के लिए टॉप स्पीड को 160 पर सीमित कर दिया है
+        int localMaxSpeed = (mode == 2) ? 160 : MAX_SPEED;
+        int localMinSpeed = (mode == 2) ? 110 : MIN_SPEED;
+
+        if (ultrasonicHealthy && globalDist <= 100 && globalDist >= 25) {
+          currentSpeed = map(globalDist, 25, 100, localMinSpeed, localMaxSpeed);
+        } else if (globalDist > 100) {
+          currentSpeed = localMaxSpeed;
+        }
+
+        // ऑब्सटेकल सामने आने पर डिसीजन मेकिंग
+        if (ultrasonicHealthy && globalDist < 25 && globalDist > 0) {
+          stopMotors();
+          
+          // इको मोड में रहने पर बज़र बहुत छोटी बीप देगा ताकि एक्स्ट्रा पावर बर्न न हो
+          digitalWrite(BUZZER, HIGH); 
+          delay(mode == 2 ? 20 : 80); 
+          digitalWrite(BUZZER, LOW);
+          
+          turnCounter++; 
+
+          if (turnCounter >= 3) { 
+            if (mode == 2) robotStatus = "ECO: CORNER ESCAPE!";
+            else robotStatus = "CORNER ESCAPE!";
+            
+            moveBackward(TURN_SPEED); delay(800); 
+            turnRight(TURN_SPEED); delay(1000); 
+            stopMotors();
+            turnCounter = 0; 
+            moveForward(currentSpeed);
+            lastUpdate = millis();
+            return; 
+          }
+
+          // रडार दोनों तरफ घूमकर साफ रास्ता ढूँढेगा
+          scanAndChoosePath();
+          moveForward(currentSpeed);
+        } 
+        else {
+          if(globalDist > 50) turnCounter = 0; 
+          moveForward(currentSpeed); 
+        }
+      }
+    }
+    lastUpdate = millis();
+  }  
+}
